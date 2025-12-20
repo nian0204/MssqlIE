@@ -71,7 +71,7 @@ func buildInsertSQL(table string, cols []string) (string, error) {
 	placeholders := make([]string, len(cols))
 	for i, col := range cols {
 		safeCols[i] = fmt.Sprintf("[%s]", strings.ReplaceAll(col, "]", "]]"))
-		placeholders[i] = fmt.Sprintf("@p%d", i)
+		placeholders[i] = "?"
 	}
 
 	return fmt.Sprintf(
