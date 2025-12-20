@@ -4,9 +4,14 @@ package conn
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
+	"github.com/microsoft/go-mssqldb/msdsn"
+
+	"github.com/mssql_ie/config"
 )
 
 // Connect 建立并返回SQL Server数据库连接
@@ -39,35 +44,48 @@ func Connect(cfg config.DBConfig) (*sql.DB, error) {
 
 // buildConnStr 构建SQL Server连接字符串
 func buildConnStr(cfg config.DBConfig) (string, error) {
-	encrypt := "disable"
-	if cfg.Encrypt {
-		encrypt = "enable"
+	/*
+		EncryptionOff      = 0
+		EncryptionRequired = 1
+		EncryptionDisabled = 3
+		EncryptionStrict   = 4
+	*/
+	encrypt := 3
+	switch strings.ToLower(cfg.Encrypt) {
+	case "off":
+		encrypt = 0
+	case "required":
+		encrypt = 1
+	case "disabled":
+		encrypt = 3
+	case "strict":
+		encrypt = 4
+	default:
+		encrypt = 3
 	}
 
-	// 基础连接参数
-	params := map[string]string{
-		"server":         fmt.Sprintf("%s,%d", cfg.Server, cfg.Port),
-		"user id":        cfg.User,
-		"password":       cfg.Password,
-		"database":       cfg.DBName,
-		"encrypt":        encrypt,
-		"connection timeout": "30",
+	mssqlConfig := msdsn.Config{
+		User:       cfg.User,
+		Password:   cfg.Password,
+		Port:       cfg.Port,
+		Database:   cfg.DBName,
+		Host:       cfg.Server,
+		Encryption: msdsn.Encryption(encrypt),
 	}
+	params := make(map[string]interface{})
+	params["protocol"] = "tcp"
+	query := url.Values{}
+	if len(cfg.Charset) > 0 {
+		query.Add("charset", cfg.Charset)
 
-	
-
-	// 拼接连接字符串
-	var connStrParts []string
-	for k, v := range params {
-		connStrParts = append(connStrParts, fmt.Sprintf("%s=%s", k, v))
 	}
-
-	return mssqldb.BuildConnectionString(strings.Join(connStrParts, ";"))
+	mssqlConfig.URL().RawQuery = query.Encode()
+	return mssqlConfig.URL().String(), nil
 }
 
 // setConnPool 配置连接池参数
 func setConnPool(db *sql.DB) {
-	db.SetMaxOpenConns(10)    // 最大打开连接数
-	db.SetMaxIdleConns(5)     // 最大空闲连接数
+	db.SetMaxOpenConns(10)                 // 最大打开连接数
+	db.SetMaxIdleConns(5)                  // 最大空闲连接数
 	db.SetConnMaxLifetime(5 * time.Minute) // 连接最大存活时间
 }

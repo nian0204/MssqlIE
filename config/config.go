@@ -3,11 +3,12 @@ package config
 // DBConfig 数据库连接配置
 type DBConfig struct {
 	Server   string // SQL Server地址
-	Port     int    // SQL Server端口
+	Port     uint64 // SQL Server端口
 	User     string // 数据库用户名
 	Password string // 数据库密码
 	DBName   string // 数据库名
-	Encrypt  bool   // 是否启用加密连接
+	Encrypt  string // 是否启用加密连接
+	Charset  string
 }
 
 // ExportConfig 导出配置（包含数据库配置+导出专属配置）
