@@ -1,7 +1,7 @@
-// Package main 演示如何使用sqlserver-csv库构建CLI工具
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"os"
@@ -21,6 +21,7 @@ func main() {
 	password := rootFlags.String("password", "", "数据库密码")
 	dbName := rootFlags.String("db", "", "数据库名")
 	encrypt := rootFlags.Bool("encrypt", false, "是否启用加密连接")
+	charset := rootFlags.String("charset", "", "字符集")
 
 	// 导出子命令参数
 	exportFlags := flag.NewFlagSet("export", flag.ContinueOnError)
@@ -34,26 +35,28 @@ func main() {
 	importCSV := importFlags.String("csv", "", "CSV文件路径")
 	importBatch := importFlags.Int("batch", 1000, "批量插入大小")
 
-	// 解析命令行
+	// 校验最少参数（必须包含子命令）
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	// 先解析共享参数
+	// 解析全局参数（子命令前的参数）
 	if err := rootFlags.Parse(os.Args[2:]); err != nil {
 		printUsage()
 		os.Exit(1)
 	}
 
-	// 构建数据库配置
+	// 构建数据库配置（修复类型不匹配问题）
 	dbCfg := config.DBConfig{
 		Server:   *server,
-		Port:     *port,
+		Port:     uint64(*port), // 转换为uint64匹配config定义
 		User:     *user,
 		Password: *password,
 		DBName:   *dbName,
-		Encrypt:  *encrypt,
+		// 转换bool为字符串（匹配conn包的加密配置处理）
+		Encrypt: map[bool]string{true: "strict", false: "off"}[*encrypt],
+		Charset: *charset,
 	}
 
 	// 校验共享参数
@@ -71,12 +74,30 @@ func main() {
 	}
 	defer db.Close()
 
-	// 处理子命令
+	// 处理子命令（修复参数解析逻辑）
 	switch os.Args[1] {
 	case "export":
-		handleExport(exportFlags, rootFlags.Args(), db, dbCfg)
+		// 解析导出子命令参数
+		if err := exportFlags.Parse(rootFlags.Args()); err != nil {
+			printUsage()
+			os.Exit(1)
+		}
+		// 调用导出处理函数
+		if err := handleExport(db, *exportTable, *exportSQL, *exportCSV); err != nil {
+			fmt.Printf("❌ 导出失败: %v\n", err)
+			os.Exit(1)
+		}
 	case "import":
-		handleImport(importFlags, rootFlags.Args(), db, dbCfg)
+		// 解析导入子命令参数
+		if err := importFlags.Parse(rootFlags.Args()); err != nil {
+			printUsage()
+			os.Exit(1)
+		}
+		// 调用导入处理函数
+		if err := handleImport(db, *importTable, *importCSV, *importBatch); err != nil {
+			fmt.Printf("❌ 导入失败: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Printf("❌ 未知子命令: %s\n", os.Args[1])
 		printUsage()
@@ -84,99 +105,62 @@ func main() {
 	}
 }
 
-// handleExport 处理导出命令
-func handleExport(exportFlags *flag.FlagSet, args []string, db *config.DB, dbCfg config.DBConfig) {
-	if err := exportFlags.Parse(args); err != nil {
-		printUsage()
-		os.Exit(1)
+// 处理导出逻辑（新增函数，连接exporter包）
+func handleExport(db *sql.DB, table, sql, csvPath string) error {
+	cfg := config.ExportConfig{
+		Table:   table,
+		SQL:     sql,
+		CSVPath: csvPath,
 	}
 
-	exportCfg := config.ExportConfig{
-		DBConfig: dbCfg,
-		Table:    *exportFlags.Lookup("table").Value.(flag.Getter).Get().(string),
-		SQL:      *exportFlags.Lookup("sql").Value.(flag.Getter).Get().(string),
-		CSVPath:  *exportFlags.Lookup("csv").Value.(flag.Getter).Get().(string),
+	// 校验导出参数（二选一：表名或SQL）
+	if (table == "" && sql == "") || (table != "" && sql != "") {
+		return fmt.Errorf("必须且只能指定 -table 或 -sql 参数")
 	}
 
-	// 校验导出参数
-	if exportCfg.CSVPath == "" {
-		fmt.Println("❌ 错误: export 命令必须指定 -csv 参数")
-		printUsage()
-		os.Exit(1)
+	// 调用导出功能
+	if table != "" {
+		return exporter.TableToCSV(db, cfg)
 	}
-	if (exportCfg.Table == "" && exportCfg.SQL == "") || (exportCfg.Table != "" && exportCfg.SQL != "") {
-		fmt.Println("❌ 错误: export 命令必须且只能指定 -table 或 -sql 其中一个参数")
-		printUsage()
-		os.Exit(1)
-	}
-
-	// 执行导出
-	if exportCfg.Table != "" {
-		if err := exporter.TableToCSV(db, exportCfg); err != nil {
-			fmt.Printf("❌ 表导出失败: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		if err := exporter.SQLToCSV(db, exportCfg); err != nil {
-			fmt.Printf("❌ SQL导出失败: %v\n", err)
-			os.Exit(1)
-		}
-	}
+	return exporter.SQLToCSV(db, cfg)
 }
 
-// handleImport 处理导入命令
-func handleImport(importFlags *flag.FlagSet, args []string, db *config.DB, dbCfg config.DBConfig) {
-	if err := importFlags.Parse(args); err != nil {
-		printUsage()
-		os.Exit(1)
+// 处理导入逻辑（新增函数，连接importer包）
+func handleImport(db *sql.DB, table, csvPath string, batch int) error {
+	cfg := config.ImportConfig{
+		Table:   table,
+		CSVPath: csvPath,
+		Batch:   batch,
 	}
-
-	importCfg := config.ImportConfig{
-		DBConfig: dbCfg,
-		Table:    *importFlags.Lookup("table").Value.(flag.Getter).Get().(string),
-		CSVPath:  *importFlags.Lookup("csv").Value.(flag.Getter).Get().(string),
-		Batch:    *importFlags.Lookup("batch").Value.(flag.Getter).Get().(int),
-	}
-
-	// 校验导入参数
-	if importCfg.Table == "" || importCfg.CSVPath == "" {
-		fmt.Println("❌ 错误: import 命令必须指定 -table 和 -csv 参数")
-		printUsage()
-		os.Exit(1)
-	}
-
-	// 执行导入
-	if err := importer.CSVToTable(db, importCfg); err != nil {
-		fmt.Printf("❌ CSV导入失败: %v\n", err)
-		os.Exit(1)
-	}
+	return importer.CSVToTable(db, cfg)
 }
 
-// printUsage 打印使用说明
+// 打印使用说明（新增函数，修复未定义问题）
 func printUsage() {
-	fmt.Println("SQL Server CSV 导入导出工具（基于sqlserver-csv库）")
-	fmt.Println("========================================")
-	fmt.Println("用法:")
-	fmt.Println("  导出: ./sqlserver-csv export [参数]")
-	fmt.Println("  导入: ./sqlserver-csv import [参数]")
-	fmt.Println("\n共享参数（所有命令必选）:")
-	fmt.Println("  -server    SQL Server地址 (默认: localhost)")
-	fmt.Println("  -port      SQL Server端口 (默认: 1433)")
-	fmt.Println("  -user      数据库用户名 (默认: sa)")
-	fmt.Println("  -password  数据库密码 (必填)")
-	fmt.Println("  -db        数据库名 (必填)")
-	fmt.Println("  -encrypt   是否启用加密连接 (默认: false)")
-	fmt.Println("\n导出参数 (export):")
-	fmt.Println("  -table     要导出的表名（与-sql二选一）")
-	fmt.Println("  -sql       自定义导出SQL（与-table二选一）")
-	fmt.Println("  -csv       CSV输出文件路径 (必填)")
-	fmt.Println("\n导入参数 (import):")
-	fmt.Println("  -table     目标表名 (必填)")
-	fmt.Println("  -csv       CSV文件路径 (必填)")
-	fmt.Println("  -batch     批量插入大小 (默认: 1000)")
-	fmt.Println("\n示例:")
-	fmt.Println("  导出表:")
-	fmt.Println("    ./sqlserver-csv export -server 127.0.0.1 -port 1433 -user sa -password 123456 -db TestDB -table Users -csv ./users.csv")
-	fmt.Println("  导入CSV:")
-	fmt.Println("    ./sqlserver-csv import -server 127.0.0.1 -port 1433 -user sa -password 123456 -db TestDB -table Users -csv ./users.csv -batch 500")
+	usage := `用法: mssql-ie [全局参数] 子命令 [子命令参数]
+
+子命令:
+  export    将数据从SQL Server导出为CSV
+  import    将CSV数据导入到SQL Server
+
+全局参数:
+  -server   SQL Server地址 (默认: localhost)
+  -port     SQL Server端口 (默认: 1433)
+  -user     数据库用户名 (默认: sa)
+  -password 数据库密码 (必填)
+  -db       数据库名 (必填)
+  -encrypt  是否启用加密连接 (默认: false)
+  -charset  字符集 (可选)
+
+export子命令参数:
+  -table    导出表名（与-sql二选一）
+  -sql      自定义导出SQL（与-table二选一）
+  -csv      CSV输出路径（必填）
+
+import子命令参数:
+  -table    目标表名（必填）
+  -csv      CSV文件路径（必填）
+  -batch    批量插入大小 (默认: 1000)
+`
+	fmt.Print(usage)
 }
