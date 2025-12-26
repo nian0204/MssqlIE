@@ -39,6 +39,7 @@ func CSVToTable(db *sql.DB, cfg config.ImportConfig) error {
 		return fmt.Errorf("获取表列名失败: %w", err)
 	}
 	var headerRow []string
+	var insertCols = make([]ColumnInfo, 0, len(columnInfos))
 	if cfg.Header {
 		headerRow, err = reader.Read()
 		if err != nil {
@@ -52,6 +53,7 @@ func CSVToTable(db *sql.DB, cfg config.ImportConfig) error {
 			found := false
 			for _, dbCol := range columnInfos {
 				if strings.EqualFold(col, dbCol.Name) {
+					insertCols = append(insertCols, dbCol)
 					found = true
 					break
 				}
@@ -85,9 +87,8 @@ func CSVToTable(db *sql.DB, cfg config.ImportConfig) error {
 			return fmt.Errorf("清空表失败: %w", err)
 		}
 	}
-
 	// 开始事务批量插入
-	return batchInsert(db, insertSQL, reader, columnInfos, cfg.Batch, cfg.SkipErrors, !cfg.Header, cfg.BinaryFormat)
+	return batchInsert(db, insertSQL, reader, insertCols, cfg.Batch, cfg.SkipErrors, !cfg.Header, cfg.BinaryFormat)
 }
 
 // validateImportConfig 校验导入配置
@@ -256,7 +257,15 @@ func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, safeCols []Co
 			if v == "" {
 				args[i] = nil
 			} else {
-				args[i] = v
+				args[i], err = convertValue(v, safeCols[i], binaryFormat)
+				if err != nil {
+					if skipErrors {
+						errorRows = append(errorRows, rowNum)
+						continue
+					}
+					tx.Rollback()
+					return fmt.Errorf("转换值失败(行%d,列%d): %w", rowNum, i+1, err)
+				}
 			}
 		}
 
