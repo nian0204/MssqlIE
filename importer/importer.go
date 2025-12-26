@@ -178,7 +178,7 @@ func buildInsertSQL(table string, safeCols []string) (string, error) {
 	// 构建占位符
 	placeholders := make([]string, len(safeCols))
 	for i := range safeCols {
-		placeholders[i] = fmt.Sprintf("@p%d", i+1)
+		placeholders[i] = "?"
 	}
 
 	return fmt.Sprintf(
