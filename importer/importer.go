@@ -1,4 +1,4 @@
-// Package importer 提供从CSV文件导入数据到SQL Server表的功能
+// importer/import.go
 package importer
 
 import (
@@ -9,12 +9,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mssql_ie/config" // 替换为实际命名空间
+	"github.com/mssql_ie/config"
+	"github.com/mssql_ie/utils"
 )
 
 // CSVToTable 从CSV文件导入数据到指定表
-// 参数: db - 已建立的数据库连接; cfg - 导入配置
-// 返回: error - 导入错误（非nil表示失败）
 func CSVToTable(db *sql.DB, cfg config.ImportConfig) error {
 	// 参数校验
 	if err := validateImportConfig(cfg); err != nil {
@@ -28,21 +27,68 @@ func CSVToTable(db *sql.DB, cfg config.ImportConfig) error {
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-	// 读取列名（第一行）
-	cols, err := reader.Read()
+	// 应用字符集转换
+	reader := csv.NewReader(utils.GetTransformersRead(file, cfg.FileCharset))
+	reader.Comma = cfg.Delimiter
+
+	// 读取列名
+	var columnInfos []ColumnInfo
+	// 如果没有标题行，尝试从数据库获取列名
+	columnInfos, err = getTableColumns(db, cfg.Table)
 	if err != nil {
-		return fmt.Errorf("读取CSV列名失败: %w", err)
+		return fmt.Errorf("获取表列名失败: %w", err)
+	}
+	var headerRow []string
+	var insertCols = make([]ColumnInfo, 0, len(columnInfos))
+	if cfg.Header {
+		headerRow, err = reader.Read()
+		if err != nil {
+			return fmt.Errorf("读取CSV列名失败: %w", err)
+		}
+		// 检查CSV列名是否与数据库列名匹配
+		if len(headerRow) != len(columnInfos) {
+			return fmt.Errorf("CSV列数 %d 与数据库列数 %d 不匹配", len(headerRow), len(columnInfos))
+		}
+		for _, col := range headerRow {
+			found := false
+			for _, dbCol := range columnInfos {
+				if strings.EqualFold(col, dbCol.Name) {
+					insertCols = append(insertCols, dbCol)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("CSV列 %s 与数据库列名不匹配", col)
+			}
+		}
+	} else {
+		headerRow = make([]string, len(columnInfos))
+		for i, col := range columnInfos {
+			headerRow[i] = col.Name
+		}
+	}
+
+	// 安全地转义列名
+	safeCols := make([]string, len(headerRow))
+	for i, col := range headerRow {
+		safeCols[i] = utils.EscapeIdentifier(col)
 	}
 
 	// 构建插入SQL
-	insertSQL, err := buildInsertSQL(cfg.Table, cols)
+	insertSQL, err := buildInsertSQL(cfg.Table, safeCols)
 	if err != nil {
 		return fmt.Errorf("构建插入SQL失败: %w", err)
 	}
 
+	// 如果需要，先清空表
+	if cfg.Truncate {
+		if err := truncateTable(db, cfg.Table); err != nil {
+			return fmt.Errorf("清空表失败: %w", err)
+		}
+	}
 	// 开始事务批量插入
-	return batchInsert(db, insertSQL, reader, cols, cfg.Batch)
+	return batchInsert(db, insertSQL, reader, insertCols, cfg.Batch, cfg.SkipErrors, !cfg.Header, cfg.BinaryFormat)
 }
 
 // validateImportConfig 校验导入配置
@@ -59,19 +105,81 @@ func validateImportConfig(cfg config.ImportConfig) error {
 	return nil
 }
 
+type ColumnInfo struct {
+	Name     string
+	DataType string
+	Nullable bool
+}
+
+// getTableColumns 从数据库获取表的列名
+func getTableColumns(db *sql.DB, tableName string) ([]ColumnInfo, error) {
+	// 转义表名
+	escapedTable, err := utils.EscapeQualifiedName(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("转义表名失败: %w", err)
+	}
+
+	query := fmt.Sprintf(`
+		/* mssql_ie tool query for check column*/
+		SELECT COLUMN_NAME ,DATA_TYPE,IS_NULLABLE
+		FROM INFORMATION_SCHEMA.COLUMNS 
+		WHERE TABLE_SCHEMA = COALESCE(PARSENAME('%s', 2), 'dbo')
+			AND TABLE_NAME = PARSENAME('%s', 1)
+		ORDER BY ORDINAL_POSITION
+	`, escapedTable, escapedTable)
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("查询表结构失败: %w", err)
+	}
+	defer rows.Close()
+
+	var columns []ColumnInfo
+	for rows.Next() {
+		var col ColumnInfo
+		var nullableStr string
+		if err := rows.Scan(&col.Name, &col.DataType, &nullableStr); err != nil {
+			return nil, err
+		}
+		col.Nullable = nullableStr == "YES"
+		columns = append(columns, col)
+	}
+
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("表 %s 不存在或没有列", tableName)
+	}
+
+	return columns, nil
+}
+
+// truncateTable 清空表
+func truncateTable(db *sql.DB, tableName string) error {
+	escapedTable, err := utils.EscapeQualifiedName(tableName)
+	if err != nil {
+		return fmt.Errorf("转义表名失败: %w", err)
+	}
+
+	// 使用TRUNCATE TABLE
+	_, err = db.Exec(fmt.Sprintf("TRUNCATE TABLE %s", escapedTable))
+	return err
+}
+
 // buildInsertSQL 构建参数化插入SQL
-func buildInsertSQL(table string, cols []string) (string, error) {
-	if len(cols) == 0 {
+func buildInsertSQL(table string, safeCols []string) (string, error) {
+	if len(safeCols) == 0 {
 		return "", fmt.Errorf("列名不能为空")
 	}
 
-	// 防SQL注入，表名/列名用[]包裹
-	safeTable := fmt.Sprintf("[%s]", strings.ReplaceAll(table, "]", "]]"))
-	safeCols := make([]string, len(cols))
-	placeholders := make([]string, len(cols))
-	for i, col := range cols {
-		safeCols[i] = fmt.Sprintf("[%s]", strings.ReplaceAll(col, "]", "]]"))
-		placeholders[i] = fmt.Sprintf("@p%d", i)
+	// 转义表名
+	safeTable, err := utils.EscapeQualifiedName(table)
+	if err != nil {
+		return "", fmt.Errorf("转义表名失败: %w", err)
+	}
+
+	// 构建占位符
+	placeholders := make([]string, len(safeCols))
+	for i := range safeCols {
+		placeholders[i] = "?"
 	}
 
 	return fmt.Sprintf(
@@ -82,18 +190,19 @@ func buildInsertSQL(table string, cols []string) (string, error) {
 	), nil
 }
 
-// batchInsert 批量插入数据（事务+预处理）
-func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, cols []string, batchSize int) error {
+// batchInsert 批量插入数据
+func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, safeCols []ColumnInfo, batchSize int, skipErrors, skipFirstRow bool, binaryFormat string) error {
 	// 开始事务
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
 	}
-	// 异常回滚
+
+	// 异常回滚处理
 	defer func() {
-		if r := recover(); r != nil {
+		if p := recover(); p != nil {
 			tx.Rollback()
-			fmt.Printf("❌ 导入异常，已回滚事务: %v\n", r)
+			panic(p) // 重新抛出panic
 		}
 	}()
 
@@ -107,38 +216,67 @@ func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, cols []string
 
 	batchCount := 0
 	totalCount := 0
+	rowNum := 0
+	errorRows := []int{}
 
-	// 循环读取CSV行并插入
+	// 循环读取CSV行
 	for {
 		row, err := reader.Read()
+		rowNum++
+
+		// 跳过标题行
+		if skipFirstRow && rowNum == 1 {
+			continue
+		}
+
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
+			if skipErrors {
+				errorRows = append(errorRows, rowNum)
+				continue
+			}
 			tx.Rollback()
-			return fmt.Errorf("读取CSV行失败(行%d): %w", totalCount+2, err) // +2 因为第一行是列名
+			return fmt.Errorf("读取CSV行失败(行%d): %w", rowNum, err)
 		}
 
 		// 列数校验
-		if len(row) != len(cols) {
+		if len(row) != len(safeCols) {
+			if skipErrors {
+				errorRows = append(errorRows, rowNum)
+				continue
+			}
 			tx.Rollback()
-			return fmt.Errorf("行%d数据列数不匹配（期望%d列，实际%d列）", totalCount+2, len(cols), len(row))
+			return fmt.Errorf("行%d数据列数不匹配（期望%d列，实际%d列）", rowNum, len(safeCols), len(row))
 		}
 
-		// 转换参数（空字符串转NULL）
+		// 准备参数
 		args := make([]interface{}, len(row))
 		for i, v := range row {
 			if v == "" {
 				args[i] = nil
 			} else {
-				args[i] = v
+				args[i], err = convertValue(v, safeCols[i], binaryFormat)
+				if err != nil {
+					if skipErrors {
+						errorRows = append(errorRows, rowNum)
+						continue
+					}
+					tx.Rollback()
+					return fmt.Errorf("转换值失败(行%d,列%d): %w", rowNum, i+1, err)
+				}
 			}
 		}
 
 		// 执行插入
 		if _, err := stmt.Exec(args...); err != nil {
+			if skipErrors {
+				errorRows = append(errorRows, rowNum)
+				continue
+			}
 			tx.Rollback()
-			return fmt.Errorf("插入行失败(行%d): %w", totalCount+2, err)
+			return fmt.Errorf("插入行失败(行%d): %w", rowNum, err)
 		}
 
 		batchCount++
@@ -149,11 +287,13 @@ func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, cols []string
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("提交批量事务失败(累计%d行): %w", totalCount, err)
 			}
-			// 重新开启事务
+
+			// 开始新事务
 			tx, err = db.Begin()
 			if err != nil {
 				return fmt.Errorf("重新开启事务失败: %w", err)
 			}
+
 			// 重新预处理语句
 			stmt, err = tx.Prepare(insertSQL)
 			if err != nil {
@@ -161,6 +301,8 @@ func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, cols []string
 				return fmt.Errorf("重新预处理语句失败: %w", err)
 			}
 			batchCount = 0
+
+			fmt.Printf("已导入 %d 行...\n", totalCount)
 		}
 	}
 
@@ -171,6 +313,93 @@ func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, cols []string
 		}
 	}
 
-	fmt.Printf("✅ CSV导入完成，共插入 %d 行数据到表 [%s]\n", totalCount, strings.Split(insertSQL, " ")[2])
+	// 输出结果
+	fmt.Printf("✅ CSV导入完成，共插入 %d 行数据\n", totalCount)
+	if len(errorRows) > 0 {
+		fmt.Printf("⚠️  跳过 %d 行错误数据: %v\n", len(errorRows), errorRows)
+	}
+
 	return nil
+}
+
+func convertValue(value string, col ColumnInfo, binaryFormat string) (interface{}, error) {
+	if value == "" {
+		if col.Nullable {
+			return nil, nil
+		}
+		return getDefaultValue(col.DataType), nil
+	}
+	switch strings.ToLower(col.DataType) {
+	case "bit":
+		value = strings.ToLower(value)
+		if value == "true" || value == "1" || value == "y" || value == "yes" || value == "t" {
+			return true, nil
+		}
+		if value == "false" || value == "0" || value == "n" || value == "no" || value == "f" {
+			return false, nil
+		}
+		return nil, fmt.Errorf("无效的位值: %s", value)
+	case "binary", "varbinary", "image":
+		return convertBinary(value, binaryFormat)
+	case "geometry", "geography":
+		return convertGeo(value, binaryFormat)
+	case "hierarchyid":
+		return convertHierarchyID(value, binaryFormat)
+	case "uniqueidentifier":
+		return convertGUID(value, binaryFormat)
+	default: // 其他类型保持字符串
+		return value, nil
+	}
+}
+func convertGUID(value, binaryFormat string) (interface{}, error) {
+	if utils.IsValidGUID(value) {
+		return value, nil
+	}
+	return convertBinary(value, binaryFormat)
+}
+func convertHierarchyID(value, binaryFormat string) ([]byte, error) {
+	return convertBinary(value, binaryFormat)
+}
+func convertGeo(value, binaryFormat string) (interface{}, error) {
+	if isValidWKT(value) {
+		return value, nil
+	}
+	return convertBinary(value, binaryFormat)
+}
+func isValidWKT(wkt string) bool {
+	return (strings.HasPrefix(strings.ToUpper(wkt), "POINT(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "LINESTRING(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "POLYGON(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "MULTIPOINT(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "MULTILINESTRING(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "MULTIPOLYGON(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "GEOMETRYCOLLECTION(")) && (strings.HasSuffix(strings.ToUpper(wkt), ")") ||
+		strings.HasSuffix(strings.ToUpper(wkt), "ZM)") ||
+		strings.HasSuffix(strings.ToUpper(wkt), "M)"))
+}
+func convertBinary(value string, binaryFormat string) ([]byte, error) {
+	switch strings.ToLower(binaryFormat) {
+	case "hex":
+		return utils.HexToBytes(value)
+	case "base64":
+		return utils.Base64ToBytes(value)
+	default: // raw
+		return []byte(value), nil
+	}
+}
+func getDefaultValue(dataType string) interface{} {
+	switch strings.ToLower(dataType) {
+	case "int", "smallint", "tinyint", "bigint", "numeric", "decimal", "real", "float":
+		return 0
+	case "bit":
+		return false
+	case "binary", "varbinary", "image":
+		return []byte{}
+	case "geometry", "geography":
+		return []byte{}
+	case "hierarchyid":
+		return []byte{}
+	default: // 其他类型返回空字符串
+		return ""
+	}
 }
