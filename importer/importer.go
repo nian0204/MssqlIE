@@ -352,8 +352,8 @@ func convertValue(value string, col ColumnInfo, binaryFormat string) (interface{
 	}
 }
 func convertGUID(value, binaryFormat string) (interface{}, error) {
-	if !utils.IsValidGUID(value) {
-		return nil, fmt.Errorf("无效的GUID值: %s", value)
+	if utils.IsValidGUID(value) {
+		return value, nil
 	}
 	return convertBinary(value, binaryFormat)
 }
