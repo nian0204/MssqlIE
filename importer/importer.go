@@ -27,21 +27,43 @@ func CSVToTable(db *sql.DB, cfg config.ImportConfig) error {
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
+	// 应用字符集转换
+	reader := csv.NewReader(utils.GetTransformersRead(file, cfg.FileCharset))
 	reader.Comma = cfg.Delimiter
 
 	// 读取列名
+	var columnInfos []ColumnInfo
+	// 如果没有标题行，尝试从数据库获取列名
+	columnInfos, err = getTableColumns(db, cfg.Table)
+	if err != nil {
+		return fmt.Errorf("获取表列名失败: %w", err)
+	}
 	var headerRow []string
 	if cfg.Header {
 		headerRow, err = reader.Read()
 		if err != nil {
 			return fmt.Errorf("读取CSV列名失败: %w", err)
 		}
+		// 检查CSV列名是否与数据库列名匹配
+		if len(headerRow) != len(columnInfos) {
+			return fmt.Errorf("CSV列数 %d 与数据库列数 %d 不匹配", len(headerRow), len(columnInfos))
+		}
+		for _, col := range headerRow {
+			found := false
+			for _, dbCol := range columnInfos {
+				if strings.EqualFold(col, dbCol.Name) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("CSV列 %s 与数据库列名不匹配", col)
+			}
+		}
 	} else {
-		// 如果没有标题行，尝试从数据库获取列名
-		headerRow, err = getTableColumns(db, cfg.Table)
-		if err != nil {
-			return fmt.Errorf("获取表列名失败: %w", err)
+		headerRow = make([]string, len(columnInfos))
+		for i, col := range columnInfos {
+			headerRow[i] = col.Name
 		}
 	}
 
@@ -65,7 +87,7 @@ func CSVToTable(db *sql.DB, cfg config.ImportConfig) error {
 	}
 
 	// 开始事务批量插入
-	return batchInsert(db, insertSQL, reader, safeCols, cfg.Batch, cfg.SkipErrors, !cfg.Header)
+	return batchInsert(db, insertSQL, reader, columnInfos, cfg.Batch, cfg.SkipErrors, !cfg.Header, cfg.BinaryFormat)
 }
 
 // validateImportConfig 校验导入配置
@@ -82,8 +104,14 @@ func validateImportConfig(cfg config.ImportConfig) error {
 	return nil
 }
 
+type ColumnInfo struct {
+	Name     string
+	DataType string
+	Nullable bool
+}
+
 // getTableColumns 从数据库获取表的列名
-func getTableColumns(db *sql.DB, tableName string) ([]string, error) {
+func getTableColumns(db *sql.DB, tableName string) ([]ColumnInfo, error) {
 	// 转义表名
 	escapedTable, err := utils.EscapeQualifiedName(tableName)
 	if err != nil {
@@ -92,7 +120,7 @@ func getTableColumns(db *sql.DB, tableName string) ([]string, error) {
 
 	query := fmt.Sprintf(`
 		/* mssql_ie tool query for check column*/
-		SELECT COLUMN_NAME 
+		SELECT COLUMN_NAME ,DATA_TYPE,IS_NULLABLE
 		FROM INFORMATION_SCHEMA.COLUMNS 
 		WHERE TABLE_SCHEMA = COALESCE(PARSENAME('%s', 2), 'dbo')
 			AND TABLE_NAME = PARSENAME('%s', 1)
@@ -105,12 +133,14 @@ func getTableColumns(db *sql.DB, tableName string) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var columns []string
+	var columns []ColumnInfo
 	for rows.Next() {
-		var col string
-		if err := rows.Scan(&col); err != nil {
+		var col ColumnInfo
+		var nullableStr string
+		if err := rows.Scan(&col.Name, &col.DataType, &nullableStr); err != nil {
 			return nil, err
 		}
+		col.Nullable = nullableStr == "YES"
 		columns = append(columns, col)
 	}
 
@@ -160,7 +190,7 @@ func buildInsertSQL(table string, safeCols []string) (string, error) {
 }
 
 // batchInsert 批量插入数据
-func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, safeCols []string, batchSize int, skipErrors, skipFirstRow bool) error {
+func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, safeCols []ColumnInfo, batchSize int, skipErrors, skipFirstRow bool, binaryFormat string) error {
 	// 开始事务
 	tx, err := db.Begin()
 	if err != nil {
@@ -281,4 +311,78 @@ func batchInsert(db *sql.DB, insertSQL string, reader *csv.Reader, safeCols []st
 	}
 
 	return nil
+}
+
+func convertValue(value string, col ColumnInfo, binaryFormat string) (interface{}, error) {
+	if value == "" {
+		if col.Nullable {
+			return nil, nil
+		}
+		return getDefaultValue(col.DataType), nil
+	}
+	switch strings.ToLower(col.DataType) {
+	case "bit":
+		value = strings.ToLower(value)
+		if value == "true" || value == "1" || value == "y" || value == "yes" || value == "t" {
+			return true, nil
+		}
+		if value == "false" || value == "0" || value == "n" || value == "no" || value == "f" {
+			return false, nil
+		}
+		return nil, fmt.Errorf("无效的位值: %s", value)
+	case "binary", "varbinary", "image":
+		return convertBinary(value, binaryFormat)
+	case "geometry", "geography":
+		return convertGeo(value, binaryFormat)
+	case "hierarchyid":
+		return convertHierarchyID(value, binaryFormat)
+	default: // 其他类型保持字符串
+		return value, nil
+	}
+}
+func convertHierarchyID(value, binaryFormat string) ([]byte, error) {
+	return convertBinary(value, binaryFormat)
+}
+func convertGeo(value, binaryFormat string) (interface{}, error) {
+	if isValidWKT(value) {
+		return value, nil
+	}
+	return convertBinary(value, binaryFormat)
+}
+func isValidWKT(wkt string) bool {
+	return (strings.HasPrefix(strings.ToUpper(wkt), "POINT(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "LINESTRING(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "POLYGON(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "MULTIPOINT(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "MULTILINESTRING(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "MULTIPOLYGON(") ||
+		strings.HasPrefix(strings.ToUpper(wkt), "GEOMETRYCOLLECTION(")) && (strings.HasSuffix(strings.ToUpper(wkt), ")") ||
+		strings.HasSuffix(strings.ToUpper(wkt), "ZM)") ||
+		strings.HasSuffix(strings.ToUpper(wkt), "M)"))
+}
+func convertBinary(value string, binaryFormat string) ([]byte, error) {
+	switch strings.ToLower(binaryFormat) {
+	case "hex":
+		return utils.HexToBytes(value)
+	case "base64":
+		return utils.Base64ToBytes(value)
+	default: // raw
+		return []byte(value), nil
+	}
+}
+func getDefaultValue(dataType string) interface{} {
+	switch strings.ToLower(dataType) {
+	case "int", "smallint", "tinyint", "bigint", "numeric", "decimal", "real", "float":
+		return 0
+	case "bit":
+		return false
+	case "binary", "varbinary", "image":
+		return []byte{}
+	case "geometry", "geography":
+		return []byte{}
+	case "hierarchyid":
+		return []byte{}
+	default: // 其他类型返回空字符串
+		return ""
+	}
 }

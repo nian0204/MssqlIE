@@ -62,10 +62,10 @@ func main() {
 				Required: true,
 				EnvVars:  []string{"MSSQL_DBNAME", "DB_NAME"},
 			},
-			&cli.BoolFlag{
+			&cli.StringFlag{
 				Name:    "encrypt",
 				Aliases: []string{"E"},
-				Value:   false,
+				Value:   "off",
 				Usage:   "是否启用加密连接",
 				EnvVars: []string{"MSSQL_ENCRYPT"},
 			},
@@ -122,6 +122,18 @@ func main() {
 						Usage:   "限制导出记录数 (0表示无限制)",
 						Value:   0,
 					},
+					&cli.StringFlag{
+						Name:    "binary-format",
+						Aliases: []string{"bf"},
+						Usage:   "二进制数格式 {hex, base64, raw}",
+						Value:   "raw",
+					},
+					&cli.StringFlag{
+						Name:    "file-charset",
+						Aliases: []string{"fc"},
+						Usage:   "文件的字符集 {utf8,gbk,latinl}",
+						Value:   "utf8",
+					},
 				},
 				Before: validateExportFlags,
 				Action: exportCommand,
@@ -169,6 +181,18 @@ func main() {
 						Usage: "跳过错误行继续导入",
 						Value: false,
 					},
+					&cli.StringFlag{
+						Name:    "binary-format",
+						Aliases: []string{"bf"},
+						Usage:   "二进制数格式 {hex, base64, raw}",
+						Value:   "raw",
+					},
+					&cli.StringFlag{
+						Name:    "file-charset",
+						Aliases: []string{"fc"},
+						Usage:   "文件的字符集 {utf8,gbk,latinl}",
+						Value:   "utf8",
+					},
 				},
 				Before: validateImportFlags,
 				Action: importCommand,
@@ -204,19 +228,13 @@ func main() {
 
 // 构建数据库配置
 func buildDBConfig(c *cli.Context) config.DBConfig {
-	// 转换加密参数
-	encryptMode := "off"
-	if c.Bool("encrypt") {
-		encryptMode = "strict"
-	}
-
 	return config.DBConfig{
 		Server:   c.String("server"),
 		Port:     uint64(c.Int("port")),
 		User:     c.String("user"),
 		Password: c.String("password"),
 		DBName:   c.String("db"),
-		Encrypt:  encryptMode,
+		Encrypt:  c.String("encrypt"),
 		Charset:  c.String("charset"),
 		Timeout:  uint64(c.Int("timeout")),
 	}
@@ -248,12 +266,14 @@ func exportCommand(c *cli.Context) error {
 	}
 
 	cfg := config.ExportConfig{
-		Table:     c.String("table"),
-		SQL:       c.String("sql"),
-		CSVPath:   c.String("csv"),
-		Header:    c.Bool("header"),
-		Delimiter: delimiter,
-		Limit:     c.Int("limit"),
+		Table:        c.String("table"),
+		SQL:          c.String("sql"),
+		CSVPath:      c.String("csv"),
+		Header:       c.Bool("header"),
+		Delimiter:    delimiter,
+		Limit:        c.Int("limit"),
+		BinaryFormat: c.String("binary-format"),
+		FileCharset:  c.String("file-charset"),
 	}
 
 	if cfg.Table != "" {
@@ -290,13 +310,15 @@ func importCommand(c *cli.Context) error {
 	}
 
 	cfg := config.ImportConfig{
-		Table:      c.String("table"),
-		CSVPath:    c.String("csv"),
-		Batch:      c.Int("batch"),
-		Header:     c.Bool("header"),
-		Delimiter:  delimiter,
-		Truncate:   c.Bool("truncate"),
-		SkipErrors: c.Bool("skip-errors"),
+		Table:        c.String("table"),
+		CSVPath:      c.String("csv"),
+		Batch:        c.Int("batch"),
+		Header:       c.Bool("header"),
+		Delimiter:    delimiter,
+		Truncate:     c.Bool("truncate"),
+		SkipErrors:   c.Bool("skip-errors"),
+		BinaryFormat: c.String("binary-format"),
+		FileCharset:  c.String("file-charset"),
 	}
 
 	if err := importer.CSVToTable(db, cfg); err != nil {

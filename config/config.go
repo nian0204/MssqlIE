@@ -15,21 +15,25 @@ type DBConfig struct {
 
 // ExportConfig 导出配置
 type ExportConfig struct {
-	Table     string
-	SQL       string
-	CSVPath   string
-	Header    bool
-	Delimiter rune
-	Limit     int
+	Table        string
+	SQL          string
+	CSVPath      string
+	Header       bool
+	Delimiter    rune
+	Limit        int
+	BinaryFormat string
+	FileCharset  string
 }
 
 // ImportConfig 导入配置
 type ImportConfig struct {
-	Table      string
-	CSVPath    string
-	Batch      int
-	Header     bool
-	Delimiter  rune
-	Truncate   bool
-	SkipErrors bool
+	Table        string
+	CSVPath      string
+	Batch        int
+	Header       bool
+	Delimiter    rune
+	Truncate     bool
+	SkipErrors   bool
+	BinaryFormat string
+	FileCharset  string
 }

@@ -3,6 +3,7 @@ package exporter
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/csv"
 	"fmt"
 	"os"
@@ -82,7 +83,9 @@ func exportQueryResultToCSV(db *sql.DB, query string, cfg config.ExportConfig) e
 	}
 	defer file.Close()
 
-	writer := csv.NewWriter(file)
+	// 应用字符集转换
+	transformer := utils.GetTransformersWrite(file, cfg.FileCharset)
+	writer := csv.NewWriter(transformer)
 	writer.Comma = cfg.Delimiter
 	defer writer.Flush()
 
@@ -110,7 +113,7 @@ func exportQueryResultToCSV(db *sql.DB, query string, cfg config.ExportConfig) e
 		// 转换为字符串
 		row := make([]string, len(cols))
 		for i, v := range values {
-			row[i] = convertValueToString(v)
+			row[i] = convertValueToString(v, cfg.BinaryFormat)
 		}
 
 		if err := writer.Write(row); err != nil {
@@ -138,14 +141,14 @@ func exportQueryResultToCSV(db *sql.DB, query string, cfg config.ExportConfig) e
 }
 
 // convertValueToString 将数据库返回值转换为字符串
-func convertValueToString(v interface{}) string {
+func convertValueToString(v interface{}, binaryFormat string) string {
 	if v == nil {
 		return ""
 	}
 
 	switch val := v.(type) {
 	case []byte:
-		return string(val)
+		return convertBinaryToString(val, binaryFormat)
 	case string:
 		return val
 	case int64:
@@ -168,5 +171,23 @@ func convertValueToString(v interface{}) string {
 		return val.Format("2006-01-02 15:04:05.000")
 	default:
 		return fmt.Sprintf("%v", val)
+	}
+}
+func convertBinaryToString(b []byte, binaryFormat string) string {
+	if b == nil || len(b) == 0 {
+		return ""
+	}
+	switch binaryFormat {
+	case "hex":
+		hexString := fmt.Sprintf("%x", b)
+		// 确保每个字节用2个字符表示
+		if len(hexString)%2 != 0 {
+			hexString = "0" + hexString
+		}
+		return hexString
+	case "base64":
+		return base64.StdEncoding.EncodeToString(b)
+	default: // raw
+		return string(b)
 	}
 }
