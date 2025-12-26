@@ -345,9 +345,17 @@ func convertValue(value string, col ColumnInfo, binaryFormat string) (interface{
 		return convertGeo(value, binaryFormat)
 	case "hierarchyid":
 		return convertHierarchyID(value, binaryFormat)
+	case "uniqueidentifier":
+		return convertGUID(value, binaryFormat)
 	default: // 其他类型保持字符串
 		return value, nil
 	}
+}
+func convertGUID(value, binaryFormat string) (interface{}, error) {
+	if !utils.IsValidGUID(value) {
+		return nil, fmt.Errorf("无效的GUID值: %s", value)
+	}
+	return convertBinary(value, binaryFormat)
 }
 func convertHierarchyID(value, binaryFormat string) ([]byte, error) {
 	return convertBinary(value, binaryFormat)
