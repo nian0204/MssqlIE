@@ -45,7 +45,7 @@ MssqlIE（MSSQL Import/Export）是一个功能强大的命令行工具，用于
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-repo/mssql-ie.git
+git clone https://github.com/nian0204/MssqlIE.git
 cd mssql-ie
 
 # 编译
